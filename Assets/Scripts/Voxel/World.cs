@@ -170,14 +170,14 @@ namespace Voxels
 
         private void ProcessRemeshQueue()
         {
-            if (_chunksToRemesh.Count == 0)
+            if (_mesher == null || _chunksToRemesh.Count == 0)
             {
                 return;
             }
 
             foreach (var coord in _chunksToRemesh)
             {
-                if (_activeChunks.TryGetValue(coord, out var chunk))
+                if (_activeChunks.TryGetValue(coord, out var chunk) && chunk != null)
                 {
                     _mesher.RebuildChunk(chunk);
                 }
@@ -227,6 +227,14 @@ namespace Voxels
                 ApplyTreePlans(blocks, _treeScratch);
                 _treeScratch.Clear();
             }
+        }
+
+        public float GetSurfaceHeightWorld(Vector3 worldPosition)
+        {
+            int blockX = Mathf.RoundToInt(worldPosition.x / VoxelMetrics.VOXEL_SIZE);
+            int blockZ = Mathf.RoundToInt(worldPosition.z / VoxelMetrics.VOXEL_SIZE);
+            var column = EvaluateColumn(blockX, blockZ);
+            return (column.SurfaceHeight + 1f) * VoxelMetrics.VOXEL_SIZE;
         }
 
         private ColumnData EvaluateColumn(int worldX, int worldZ)
@@ -991,3 +999,7 @@ namespace Voxels
         }
     }
 }
+
+
+
+

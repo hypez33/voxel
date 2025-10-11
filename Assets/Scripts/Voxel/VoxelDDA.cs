@@ -4,11 +4,11 @@ namespace Voxels
 {
     public static class VoxelDDA
     {
-        public static bool Cast(Ray ray, float maxDistance, World world, out VoxelHit hit)
+        public static bool Cast(Ray ray, float maxDistanceMeters, World world, out VoxelHit hit)
         {
             hit = default;
 
-            if (world == null || maxDistance <= 0f)
+            if (world == null || maxDistanceMeters <= 0f)
             {
                 return false;
             }
@@ -46,7 +46,7 @@ namespace Voxels
             float distance = 0f;
             Vector3Int lastNormal = Vector3Int.zero;
 
-            while (distance <= maxDistance)
+            while (distance <= maxDistanceMeters)
             {
                 if (world.TryGetBlock(block, out var blockId) && VoxelTypes.IsSolid(blockId))
                 {

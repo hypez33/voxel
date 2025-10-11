@@ -1,5 +1,6 @@
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEngine.InputSystem;
+using VoxelGame;
 
 namespace Voxels
 {
@@ -8,8 +9,8 @@ namespace Voxels
         [SerializeField] private World world;
         [SerializeField] private Camera viewCamera;
         [SerializeField] private DebrisPool debrisPool;
-        [SerializeField] private float interactDistance = 12f;
-        [SerializeField] private float removeRadius = 1.25f;
+        [SerializeField] private float interactRangeM = 4.0f; // 4 m reach (~40 voxels)
+        [SerializeField] private float mineRadiusM = 0.25f;
         [SerializeField] private float explosionRadius = 2.4f;
         [SerializeField] private float toolCooldown = 0.08f;
 
@@ -26,8 +27,8 @@ namespace Voxels
 
         private void OnValidate()
         {
-            removeRadius = Mathf.Max(removeRadius, VoxelMetrics.VOXEL_SIZE * 0.5f);
-            explosionRadius = Mathf.Max(explosionRadius, removeRadius);
+            mineRadiusM = Mathf.Max(mineRadiusM, VoxelMetrics.VOXEL_SIZE * 0.5f);
+            explosionRadius = Mathf.Max(explosionRadius, mineRadiusM);
         }
 
         private void Update()
@@ -71,7 +72,7 @@ namespace Voxels
             }
 
             var ray = new Ray(viewCamera.transform.position, viewCamera.transform.forward);
-            if (!VoxelDDA.Cast(ray, interactDistance, world, out var hit))
+            if (!VoxelDDA.Cast(ray, interactRangeM, world, out var hit))
             {
                 return;
             }
@@ -80,8 +81,8 @@ namespace Voxels
             {
                 _nextActionTime = Time.time + toolCooldown;
                 Vector3 center = VoxelMetrics.ToWorldPosition(hit.Block) + Vector3.one * (VoxelMetrics.VOXEL_SIZE * 0.5f);
-                world.RemoveSphere(center, removeRadius);
-                debrisPool?.SpawnBurst(center, 18, removeRadius * 0.5f);
+                world.RemoveSphere(center, mineRadiusM);
+                debrisPool?.SpawnBurst(center, 18, mineRadiusM * 0.5f);
             }
             else if (mouse.rightButton.isPressed)
             {
@@ -102,7 +103,7 @@ namespace Voxels
             }
 
             var ray = new Ray(viewCamera.transform.position, viewCamera.transform.forward);
-            if (!VoxelDDA.Cast(ray, interactDistance * 1.5f, world, out var hit))
+            if (!VoxelDDA.Cast(ray, interactRangeM * 1.5f, world, out var hit))
             {
                 return;
             }
@@ -113,3 +114,5 @@ namespace Voxels
         }
     }
 }
+
+

@@ -66,7 +66,7 @@ namespace Voxels
                 var inst = _instances[i];
                 inst.velocity.y += gravity * delta;
                 inst.position += inst.velocity * delta;
-                inst.rotation = Quaternion.Euler(inst.angularVelocity * delta) * inst.rotation;
+                inst.rotation = (Quaternion.Euler(inst.angularVelocity * delta) * inst.rotation).normalized;
                 inst.life += delta;
 
                 if (inst.life < inst.maxLife)
@@ -166,4 +166,5 @@ namespace Voxels
         }
     }
 }
+
 

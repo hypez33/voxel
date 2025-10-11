@@ -7,11 +7,10 @@ namespace Voxels
     public sealed class PlayerController : MonoBehaviour
     {
         [SerializeField] private Camera playerCamera;
-        [SerializeField] private float moveSpeed = 6f;
-        [SerializeField] private float sprintMultiplier = 1.7f;
+        [SerializeField] private float moveSpeed = 4.5f;
+        [SerializeField] private float sprintMultiplier = 1.6667f;
         [SerializeField] private float jumpForce = 5f;
         [SerializeField] private float flySpeed = 12f;
-        [SerializeField] private float lookSensitivity = 2.3f;
         [SerializeField] private float gravity = -18f;
 
         private CharacterController _controller;
@@ -19,18 +18,40 @@ namespace Voxels
         private Vector2 _look;
         private bool _noClip;
 
+        private const float MouseSensitivity = 0.10f;
+
         private void Awake()
         {
+            transform.localScale = Vector3.one;
+
             _controller = GetComponent<CharacterController>();
             if (playerCamera == null)
             {
                 playerCamera = GetComponentInChildren<Camera>();
             }
 
+            if (_controller != null)
+            {
+                _controller.height = 0.15f;
+                _controller.radius = 0.075f;
+                _controller.center = new Vector3(0f, _controller.height * 0.5f, 0f);
+                // Fix für Fehler 1: stepOffset muss kleiner sein als height + radius * 2
+                _controller.stepOffset = Mathf.Min(_controller.stepOffset, _controller.height + _controller.radius * 2f - 0.01f);
+            }
+
             if (playerCamera != null)
             {
+                playerCamera.fieldOfView = 60f;
                 playerCamera.nearClipPlane = Mathf.Max(0.05f, VoxelMetrics.VOXEL_SIZE * 0.2f);
+                var localPos = playerCamera.transform.localPosition;
+                localPos.y = 0.14f;
+                playerCamera.transform.localPosition = localPos;
             }
+        }
+
+        private void Start()
+        {
+            SnapToSurface();
         }
 
         private void OnEnable()
@@ -59,6 +80,7 @@ namespace Voxels
             if (keyboard.nKey.wasPressedThisFrame)
             {
                 ToggleNoClip();
+                return;
             }
 
             if (_noClip)
@@ -67,7 +89,39 @@ namespace Voxels
             }
             else
             {
+                // Stelle sicher dass der Controller aktiviert ist bevor HandleGroundMovement aufgerufen wird
+                if (_controller != null && !_controller.enabled)
+                {
+                    _controller.enabled = true;
+                    _verticalVelocity = 0f;
+                }
                 HandleGroundMovement(keyboard);
+            }
+        }
+
+        private void SnapToSurface()
+        {
+            var world = FindFirstObjectByType<World>();
+            if (world == null || _controller == null)
+            {
+                return;
+            }
+
+            float surfaceY = world.GetSurfaceHeightWorld(transform.position) + 0.02f;
+            
+            // Controller kurz deaktivieren um Position direkt zu setzen
+            bool wasEnabled = _controller.enabled;
+            _controller.enabled = false;
+
+            // Position direkt setzen
+            Vector3 newPos = new Vector3(transform.position.x, surfaceY, transform.position.z);
+            transform.position = newPos;
+            _verticalVelocity = 0f;
+
+            // Controller wieder aktivieren wenn er vorher an war
+            if (wasEnabled)
+            {
+                _controller.enabled = true;
             }
         }
 
@@ -78,8 +132,7 @@ namespace Voxels
                 return;
             }
 
-            const float mouseScale = 0.1f;
-            Vector2 delta = mouse.delta.ReadValue() * lookSensitivity * mouseScale;
+            Vector2 delta = mouse.delta.ReadValue() * MouseSensitivity;
             _look.x += delta.x;
             _look.y += delta.y;
             _look.y = Mathf.Clamp(_look.y, -89f, 89f);
@@ -90,9 +143,9 @@ namespace Voxels
 
         private void HandleGroundMovement(Keyboard keyboard)
         {
-            if (!_controller.enabled)
+            if (_controller == null || !_controller.enabled || !gameObject.activeInHierarchy)
             {
-                _controller.enabled = true;
+                return;
             }
 
             Vector3 input = Vector3.zero;
@@ -107,7 +160,6 @@ namespace Voxels
             {
                 speed *= sprintMultiplier;
             }
-
             Vector3 move = transform.TransformDirection(input) * speed;
 
             if (_controller.isGrounded)
@@ -124,12 +176,14 @@ namespace Voxels
             }
 
             move.y = _verticalVelocity;
+
+            // Move wird nur aufgerufen wenn alle Bedingungen erfüllt sind
             _controller.Move(move * Time.deltaTime);
         }
 
         private void HandleNoClipMovement(Keyboard keyboard)
         {
-            if (_controller.enabled)
+            if (_controller != null && _controller.enabled)
             {
                 _controller.enabled = false;
             }
@@ -152,16 +206,21 @@ namespace Voxels
             {
                 speed *= sprintMultiplier;
             }
-
             transform.position += move * speed * Time.deltaTime;
         }
 
         private void ToggleNoClip()
         {
             _noClip = !_noClip;
+            _verticalVelocity = 0f;
+
+            if (_controller == null)
+            {
+                return;
+            }
+
             if (_noClip)
             {
-                _verticalVelocity = 0f;
                 if (_controller.enabled)
                 {
                     _controller.enabled = false;
@@ -173,6 +232,7 @@ namespace Voxels
                 {
                     _controller.enabled = true;
                 }
+                SnapToSurface();
             }
         }
     }
