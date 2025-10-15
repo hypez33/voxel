@@ -77,9 +77,9 @@ namespace Voxels
             {
                 Mesh = new Mesh
                 {
-                    name = $"Chunk_{coordinate.x}_{coordinate.y}_{coordinate.z}",
-                    indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
+                    name = $"Chunk_{coordinate.x}_{coordinate.y}_{coordinate.z}"
                 };
+                Mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
                 Mesh.MarkDynamic();
             }
 

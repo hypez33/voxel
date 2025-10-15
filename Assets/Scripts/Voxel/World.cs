@@ -13,8 +13,15 @@ namespace Voxels
         [SerializeField] private int seed = 1337;
         [SerializeField] private Material voxelMaterial;
         [SerializeField] private Transform player;
-        [SerializeField] private int horizontalViewDistance = 6;
         [SerializeField] private int verticalChunkCount = 1;
+
+        [Header("Streaming / View Distance")]
+        [SerializeField, Range(1, 32)] private int viewRadius = 14;
+        [SerializeField, Range(1, 1024)] private int hardCapLoadedChunks = 700;
+        [SerializeField, Range(1, 16)] private int genPerFrameBudget = 2;
+        [SerializeField, Range(1, 16)] private int meshPerFrameBudget = 1;
+        [SerializeField] private bool spiralOrdering = true;
+        [SerializeField] private bool prewarmOnEnterNewChunk = true;
 
         private const int SeaLevel = 42;
         private const int SnowLine = 82;
@@ -25,17 +32,23 @@ namespace Voxels
 
         private readonly Dictionary<Vector3Int, Chunk> _activeChunks = new Dictionary<Vector3Int, Chunk>();
         private readonly Queue<Chunk> _chunkPool = new Queue<Chunk>();
-        private readonly HashSet<Vector3Int> _chunksToRemesh = new HashSet<Vector3Int>();
         private readonly HashSet<Vector3Int> _dirtyForSave = new HashSet<Vector3Int>();
         private readonly Dictionary<Vector3Int, byte[]> _pendingDiffs = new Dictionary<Vector3Int, byte[]>();
         private readonly List<Vector3Int> _releaseBuffer = new List<Vector3Int>();
         private readonly List<TreePlan> _treeScratch = new List<TreePlan>(64);
+        private readonly HashSet<Vector3Int> _loadedChunks = new HashSet<Vector3Int>();
+        private readonly HashSet<Vector3Int> _scheduledChunks = new HashSet<Vector3Int>();
+        private readonly HashSet<Vector3Int> _meshScheduled = new HashSet<Vector3Int>();
+        private readonly HashSet<Vector3Int> _targetChunks = new HashSet<Vector3Int>();
+        private Queue<Vector3Int> _generationQueue = new Queue<Vector3Int>();
+        private Queue<Vector3Int> _meshQueue = new Queue<Vector3Int>();
 
         private ChunkMesher _mesher;
         private Vector3Int _lastPlayerChunk;
 
         public Material VoxelMaterial => voxelMaterial;
         public int Seed => seed;
+        public int ViewRadius => viewRadius;
 
         private void Awake()
         {
@@ -62,11 +75,15 @@ namespace Voxels
             if (playerChunk != _lastPlayerChunk)
             {
                 _lastPlayerChunk = playerChunk;
+                if (prewarmOnEnterNewChunk)
+                {
+                    PrewarmOuterRings(playerChunk);
+                }
             }
 
-            EnsureChunkRing(playerChunk);
-            ReleaseFarChunks(playerChunk);
-            ProcessRemeshQueue();
+            UpdateStreamingTargets(playerChunk);
+            ProcessGenerationQueue();
+            ProcessMeshQueue();
         }
 
         public void SetSeed(int newSeed)
@@ -74,44 +91,296 @@ namespace Voxels
             seed = newSeed;
             _dirtyForSave.Clear();
             _pendingDiffs.Clear();
+            _targetChunks.Clear();
+            _generationQueue.Clear();
+            _scheduledChunks.Clear();
+            _meshQueue.Clear();
+            _meshScheduled.Clear();
             RegenerateVisible();
         }
         private void RegenerateVisible()
         {
             foreach (var pair in _activeChunks)
             {
-                PopulateChunk(pair.Value);
-                _chunksToRemesh.Add(pair.Key);
+                GenerateChunkData(pair.Key, pair.Value.Blocks);
+                ApplyPendingDiff(pair.Key, pair.Value);
+                _loadedChunks.Add(pair.Key);
+                EnqueueMesh(pair.Key);
             }
         }
 
-        private void EnsureChunkRing(Vector3Int center)
+        private void UpdateStreamingTargets(Vector3Int center)
         {
-            int radiusSq = horizontalViewDistance * horizontalViewDistance;
+            int radius = Mathf.Max(1, viewRadius);
+            int radiusSq = radius * radius;
             int verticalCount = Mathf.Max(1, verticalChunkCount);
-            for (int dx = -horizontalViewDistance; dx <= horizontalViewDistance; dx++)
+
+            _targetChunks.Clear();
+
+            for (int dy = 0; dy < verticalCount; dy++)
             {
-                for (int dz = -horizontalViewDistance; dz <= horizontalViewDistance; dz++)
+                for (int dz = -radius; dz <= radius; dz++)
                 {
-                    if (dx * dx + dz * dz > radiusSq)
+                    int dzSq = dz * dz;
+                    for (int dx = -radius; dx <= radius; dx++)
+                    {
+                        if (dx * dx + dzSq > radiusSq)
+                        {
+                            continue;
+                        }
+
+                        var coord = new Vector3Int(center.x + dx, dy, center.z + dz);
+                        _targetChunks.Add(coord);
+                    }
+                }
+            }
+
+            ReleaseChunksOutsideTarget();
+            PruneGenerationQueue();
+            EnqueueMissingChunks(center);
+        }
+
+        private void PrewarmOuterRings(Vector3Int center)
+        {
+            int radius = Mathf.Max(1, viewRadius);
+            int verticalCount = Mathf.Max(1, verticalChunkCount);
+            int[] rings = { Mathf.Max(0, radius - 1), radius };
+
+            foreach (int ring in rings)
+            {
+                int ringSq = ring * ring;
+                int innerSq = Mathf.Max(0, (ring - 1) * (ring - 1));
+
+                foreach (var offset in EnumerateOffsetsSpiral(radius))
+                {
+                    int distSq = offset.x * offset.x + offset.y * offset.y;
+                    if (distSq > ringSq || distSq <= innerSq)
                     {
                         continue;
                     }
 
                     for (int dy = 0; dy < verticalCount; dy++)
                     {
-                        var coord = new Vector3Int(center.x + dx, dy, center.z + dz);
-                        EnsureChunk(coord);
+                        var coord = new Vector3Int(center.x + offset.x, dy, center.z + offset.y);
+                        TryScheduleChunk(coord, ensureTarget: false);
                     }
                 }
             }
         }
 
-        private void EnsureChunk(Vector3Int coord)
+        private void EnqueueMissingChunks(Vector3Int center)
         {
-            if (_activeChunks.ContainsKey(coord))
+            int radius = Mathf.Max(1, viewRadius);
+            int radiusSq = radius * radius;
+            int verticalCount = Mathf.Max(1, verticalChunkCount);
+
+            if (spiralOrdering)
+            {
+                foreach (var offset in EnumerateOffsetsSpiral(radius))
+                {
+                    int distSq = offset.x * offset.x + offset.y * offset.y;
+                    if (distSq > radiusSq)
+                    {
+                        continue;
+                    }
+
+                    for (int dy = 0; dy < verticalCount; dy++)
+                    {
+                        var coord = new Vector3Int(center.x + offset.x, dy, center.z + offset.y);
+                        TryScheduleChunk(coord);
+                    }
+                }
+            }
+            else
+            {
+                for (int dz = -radius; dz <= radius; dz++)
+                {
+                    int dzSq = dz * dz;
+                    for (int dx = -radius; dx <= radius; dx++)
+                    {
+                        if (dx * dx + dzSq > radiusSq)
+                        {
+                            continue;
+                        }
+
+                        for (int dy = 0; dy < verticalCount; dy++)
+                        {
+                            var coord = new Vector3Int(center.x + dx, dy, center.z + dz);
+                            TryScheduleChunk(coord);
+                        }
+                    }
+                }
+            }
+        }
+
+        private void ReleaseChunksOutsideTarget()
+        {
+            _releaseBuffer.Clear();
+            foreach (var pair in _activeChunks)
+            {
+                if (!_targetChunks.Contains(pair.Key))
+                {
+                    _releaseBuffer.Add(pair.Key);
+                }
+            }
+
+            for (int i = 0; i < _releaseBuffer.Count; i++)
+            {
+                ReleaseChunk(_releaseBuffer[i]);
+            }
+        }
+
+        private void ReleaseChunk(Vector3Int coord)
+        {
+            if (_activeChunks.TryGetValue(coord, out var chunk))
+            {
+                chunk.gameObject.SetActive(false);
+                _activeChunks.Remove(coord);
+                _loadedChunks.Remove(coord);
+                _meshScheduled.Remove(coord);
+                _dirtyForSave.Remove(coord);
+                _chunkPool.Enqueue(chunk);
+            }
+        }
+
+        private void PruneGenerationQueue()
+        {
+            if (_generationQueue.Count == 0)
             {
                 return;
+            }
+
+            var newQueue = new Queue<Vector3Int>(_generationQueue.Count);
+            while (_generationQueue.Count > 0)
+            {
+                var coord = _generationQueue.Dequeue();
+                if (_targetChunks.Contains(coord))
+                {
+                    newQueue.Enqueue(coord);
+                }
+                else
+                {
+                    _scheduledChunks.Remove(coord);
+                }
+            }
+
+            _generationQueue = newQueue;
+        }
+
+        private void RemoveFromGenerationQueue(Vector3Int coord)
+        {
+            if (!_scheduledChunks.Contains(coord) || _generationQueue.Count == 0)
+            {
+                _scheduledChunks.Remove(coord);
+                return;
+            }
+
+            var newQueue = new Queue<Vector3Int>(_generationQueue.Count);
+            while (_generationQueue.Count > 0)
+            {
+                var queued = _generationQueue.Dequeue();
+                if (queued != coord)
+                {
+                    newQueue.Enqueue(queued);
+                }
+            }
+
+            _generationQueue = newQueue;
+            _scheduledChunks.Remove(coord);
+        }
+
+        private bool TryScheduleChunk(Vector3Int coord, bool ensureTarget = true)
+        {
+            if (ensureTarget && !_targetChunks.Contains(coord))
+            {
+                return false;
+            }
+
+            if (_loadedChunks.Contains(coord) || _scheduledChunks.Contains(coord))
+            {
+                return false;
+            }
+
+            if (_activeChunks.Count + _scheduledChunks.Count >= hardCapLoadedChunks)
+            {
+                return false;
+            }
+
+            _scheduledChunks.Add(coord);
+            _generationQueue.Enqueue(coord);
+            return true;
+        }
+
+        private void ProcessGenerationQueue()
+        {
+            int budget = Mathf.Max(0, genPerFrameBudget);
+            if (budget == 0)
+            {
+                return;
+            }
+
+            int processed = 0;
+            while (_generationQueue.Count > 0 && processed < budget)
+            {
+                var coord = _generationQueue.Dequeue();
+                _scheduledChunks.Remove(coord);
+
+                if (!_targetChunks.Contains(coord) || !IsWithinViewDistance(coord))
+                {
+                    continue;
+                }
+
+                if (_loadedChunks.Contains(coord))
+                {
+                    continue;
+                }
+
+                var chunk = AcquireChunk(coord);
+                GenerateChunkData(coord, chunk.Blocks);
+                ApplyPendingDiff(coord, chunk);
+                _loadedChunks.Add(coord);
+                EnqueueMesh(coord);
+                processed++;
+            }
+        }
+
+        private void ProcessMeshQueue()
+        {
+            if (_mesher == null)
+            {
+                return;
+            }
+
+            int budget = Mathf.Max(0, meshPerFrameBudget);
+            if (budget == 0)
+            {
+                return;
+            }
+
+            int processed = 0;
+            while (_meshQueue.Count > 0 && processed < budget)
+            {
+                var coord = _meshQueue.Dequeue();
+                _meshScheduled.Remove(coord);
+
+                if (!IsWithinMeshDistance(coord))
+                {
+                    continue;
+                }
+
+                if (_activeChunks.TryGetValue(coord, out var chunk) && chunk != null)
+                {
+                    _mesher.RebuildChunk(chunk);
+                    processed++;
+                }
+            }
+        }
+
+        private Chunk AcquireChunk(Vector3Int coord)
+        {
+            if (_activeChunks.TryGetValue(coord, out var existing))
+            {
+                return existing;
             }
 
             Chunk chunk;
@@ -128,11 +397,78 @@ namespace Voxels
             chunk.gameObject.SetActive(true);
             chunk.transform.SetParent(transform, false);
             chunk.Initialize(coord, this);
-            PopulateChunk(chunk);
 
             _activeChunks[coord] = chunk;
-            ApplyPendingDiff(coord, chunk);
-            _chunksToRemesh.Add(coord);
+            return chunk;
+        }
+
+        private void EnqueueMesh(Vector3Int coord)
+        {
+            if (!IsWithinMeshDistance(coord))
+            {
+                return;
+            }
+
+            if (_meshScheduled.Add(coord))
+            {
+                _meshQueue.Enqueue(coord);
+            }
+        }
+
+        private bool IsWithinViewDistance(Vector3Int coord)
+        {
+            int radius = Mathf.Max(1, viewRadius);
+            return ChunkDistanceSq(coord, _lastPlayerChunk) <= radius * radius;
+        }
+
+        private bool IsWithinMeshDistance(Vector3Int coord)
+        {
+            int radius = Mathf.Max(1, viewRadius + 2);
+            return ChunkDistanceSq(coord, _lastPlayerChunk) <= radius * radius;
+        }
+
+        private static int ChunkDistanceSq(Vector3Int a, Vector3Int b)
+        {
+            int dx = a.x - b.x;
+            int dz = a.z - b.z;
+            return dx * dx + dz * dz;
+        }
+
+        private IEnumerable<Vector2Int> EnumerateOffsetsSpiral(int maxRadius)
+        {
+            yield return Vector2Int.zero;
+
+            if (maxRadius <= 0)
+            {
+                yield break;
+            }
+
+            int x = 0;
+            int z = 0;
+            int dx = 0;
+            int dz = -1;
+            int steps = (maxRadius * 2 + 1) * (maxRadius * 2 + 1);
+
+            for (int i = 0; i < steps; i++)
+            {
+                if (Mathf.Abs(x) <= maxRadius && Mathf.Abs(z) <= maxRadius)
+                {
+                    if (x != 0 || z != 0)
+                    {
+                        yield return new Vector2Int(x, z);
+                    }
+                }
+
+                if (x == z || (x < 0 && x == -z) || (x > 0 && x == 1 - z))
+                {
+                    int temp = dx;
+                    dx = -dz;
+                    dz = temp;
+                }
+
+                x += dx;
+                z += dz;
+            }
         }
 
         private Chunk CreateChunkObject()
@@ -142,54 +478,6 @@ namespace Voxels
             return go.AddComponent<Chunk>();
         }
 
-        private void ReleaseFarChunks(Vector3Int center)
-        {
-            _releaseBuffer.Clear();
-            int maxDistanceSq = (horizontalViewDistance + 1) * (horizontalViewDistance + 1);
-            foreach (var pair in _activeChunks)
-            {
-                int dx = pair.Key.x - center.x;
-                int dz = pair.Key.z - center.z;
-                if (dx * dx + dz * dz > maxDistanceSq)
-                {
-                    _releaseBuffer.Add(pair.Key);
-                }
-            }
-
-            for (int i = 0; i < _releaseBuffer.Count; i++)
-            {
-                var coord = _releaseBuffer[i];
-                if (_activeChunks.TryGetValue(coord, out var chunk))
-                {
-                    chunk.gameObject.SetActive(false);
-                    _activeChunks.Remove(coord);
-                    _chunkPool.Enqueue(chunk);
-                }
-            }
-        }
-
-        private void ProcessRemeshQueue()
-        {
-            if (_mesher == null || _chunksToRemesh.Count == 0)
-            {
-                return;
-            }
-
-            foreach (var coord in _chunksToRemesh)
-            {
-                if (_activeChunks.TryGetValue(coord, out var chunk) && chunk != null)
-                {
-                    _mesher.RebuildChunk(chunk);
-                }
-            }
-
-            _chunksToRemesh.Clear();
-        }
-
-        private void PopulateChunk(Chunk chunk)
-        {
-            GenerateChunkData(chunk.Coordinate, chunk.Blocks);
-        }
         private void GenerateChunkData(Vector3Int chunkCoord, NativeArray<byte> blocks)
         {
             var size = VoxelMetrics.ChunkSize;
@@ -239,15 +527,15 @@ namespace Voxels
 
         private ColumnData EvaluateColumn(int worldX, int worldZ)
         {
-            float baseNoise = Noise.Fractal2D(worldX, worldZ, 160f, 5, 0.52f, 2.05f, seed);
-            float detailNoise = Noise.Fractal2D(worldX, worldZ, 42f, 3, 0.55f, 2.4f, seed + 71);
-            float ridgeNoise = Noise.Ridged2D(worldX, worldZ, 260f, 3, 0.48f, 2.15f, seed + 113);
-            float continental = Mathf.PerlinNoise((worldX + seed * 0.27f) * 0.00045f, (worldZ - seed * 0.31f) * 0.00045f);
+            float baseNoise = Noise.Fractal2D(worldX, worldZ, VoxelMetrics.ScaleFreq(160f), 5, 0.52f, 2.05f, seed);
+            float detailNoise = Noise.Fractal2D(worldX, worldZ, VoxelMetrics.ScaleFreq(42f), 3, 0.55f, 2.4f, seed + 71);
+            float ridgeNoise = Noise.Ridged2D(worldX, worldZ, VoxelMetrics.ScaleFreq(260f), 3, 0.48f, 2.15f, seed + 113);
+            float continental = Mathf.PerlinNoise((worldX + seed * 0.27f) * VoxelMetrics.ScaleFreq(0.00045f), (worldZ - seed * 0.31f) * VoxelMetrics.ScaleFreq(0.00045f));
 
             float height = SeaLevel - 6f + baseNoise * 18f + detailNoise * 6f + ridgeNoise * 24f + (continental - 0.5f) * 22f;
 
-            float temperature = Mathf.PerlinNoise((worldX + seed * 1.1f) * 0.00065f, (worldZ + seed * 0.9f) * 0.00065f);
-            float moisture = Mathf.PerlinNoise((worldX - seed * 1.7f) * 0.00065f, (worldZ - seed * 1.3f) * 0.00065f);
+            float temperature = Mathf.PerlinNoise((worldX + seed * 1.1f) * VoxelMetrics.ScaleFreq(0.00065f), (worldZ + seed * 0.9f) * VoxelMetrics.ScaleFreq(0.00065f));
+            float moisture = Mathf.PerlinNoise((worldX - seed * 1.7f) * VoxelMetrics.ScaleFreq(0.00065f), (worldZ - seed * 1.3f) * VoxelMetrics.ScaleFreq(0.00065f));
 
             var biome = SelectBiome(temperature, moisture, continental);
             height += biome.HeightOffset;
@@ -631,7 +919,7 @@ namespace Voxels
 
         private bool IsCave(int x, int y, int z)
         {
-            float scale = 0.045f;
+            float scale = VoxelMetrics.ScaleFreq(0.045f);
             float n1 = Noise.Perlin3D(x, y, z, scale, seed);
             float n2 = Noise.Perlin3D(x + seed, y - seed, z + seed * 2, scale * 1.8f, seed + 271);
             return (n1 * 0.6f + n2 * 0.4f) > CaveThreshold;
@@ -644,7 +932,7 @@ namespace Voxels
                 return false;
             }
 
-            float noise = Noise.Perlin3D(x + seed * 2, y - seed, z + seed * 3, 0.08f, seed + 312);
+            float noise = Noise.Perlin3D(x + seed * 2, y - seed, z + seed * 3, VoxelMetrics.ScaleFreq(0.08f), seed + 312);
             return noise > OreThreshold;
         }
         public bool TryGetBlock(Vector3Int worldBlock, out byte block)
@@ -711,7 +999,7 @@ namespace Voxels
         public void NotifyChunkModified(Chunk chunk, int blockIndex, byte _)
         {
             var coord = chunk.Coordinate;
-            _chunksToRemesh.Add(coord);
+            EnqueueMesh(coord);
             _dirtyForSave.Add(coord);
 
             var local = IndexToLocal(blockIndex);
@@ -727,7 +1015,7 @@ namespace Voxels
         {
             if (_activeChunks.ContainsKey(coord))
             {
-                _chunksToRemesh.Add(coord);
+                EnqueueMesh(coord);
             }
         }
 
@@ -749,8 +1037,13 @@ namespace Voxels
                 return chunk;
             }
 
-            EnsureChunk(chunkCoord);
-            return _activeChunks[chunkCoord];
+            RemoveFromGenerationQueue(chunkCoord);
+            chunk = AcquireChunk(chunkCoord);
+            GenerateChunkData(chunkCoord, chunk.Blocks);
+            ApplyPendingDiff(chunkCoord, chunk);
+            _loadedChunks.Add(chunkCoord);
+            EnqueueMesh(chunkCoord);
+            return chunk;
         }
 
         private Vector3Int BlockToChunk(Vector3Int block, out Vector3Int local)
@@ -806,8 +1099,7 @@ namespace Voxels
         {
             if (!_activeChunks.TryGetValue(coord, out var chunk))
             {
-                EnsureChunk(coord);
-                chunk = _activeChunks[coord];
+                chunk = GetOrCreateChunk(coord);
             }
 
             var blocks = chunk.Blocks;
@@ -868,7 +1160,7 @@ namespace Voxels
             if (_activeChunks.TryGetValue(coord, out var chunk))
             {
                 ApplyDiffToChunk(diffData, chunk.Blocks);
-                _chunksToRemesh.Add(coord);
+                EnqueueMesh(coord);
             }
             else
             {
@@ -974,6 +1266,9 @@ namespace Voxels
             public int TreeRadius;
             public bool SnowOnLeaves;
             public uint TreeHash;
+            public float CaveDensity;
+            public bool ForceSnow;
+            public bool IsMountain;
         }
 
         private struct BiomeSettings
@@ -988,6 +1283,12 @@ namespace Voxels
             public bool SnowOnLeaves;
             public bool IsDesert;
             public float HeightOffset;
+            public float HeightMultiplier;
+            public float TerrainVariance;
+            public float DetailVariance;
+            public float CaveDensity;
+            public bool ForceSnow;
+            public bool IsMountain;
         }
 
         private struct TreePlan

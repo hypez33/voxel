@@ -7,10 +7,10 @@ namespace Voxels
     /// </summary>
     public static class VoxelMetrics
     {
-        public const float VOXEL_SIZE = 0.10f;
-        public const int CHUNK_SIZE_X = 32;
-        public const int CHUNK_SIZE_Y = 128;
-        public const int CHUNK_SIZE_Z = 32;
+        public const float VOXEL_SIZE = 0.025f;
+        public const int CHUNK_SIZE_X = 8;
+        public const int CHUNK_SIZE_Y = 64;
+        public const int CHUNK_SIZE_Z = 8;
         public static readonly Vector3Int ChunkSize = new Vector3Int(CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z);
         public static readonly Vector3 ChunkWorldSize = new Vector3(CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z) * VOXEL_SIZE;
 
@@ -34,6 +34,14 @@ namespace Voxels
                 Mathf.FloorToInt((float)block.x / CHUNK_SIZE_X),
                 Mathf.FloorToInt((float)block.y / CHUNK_SIZE_Y),
                 Mathf.FloorToInt((float)block.z / CHUNK_SIZE_Z));
+        }
+
+        public const float BASE_VOXEL = 0.10f;
+
+        public static float ScaleFreq(float authoredForBaseVoxel)
+        {
+            // Rescales noise frequencies to match the new voxel size
+            return authoredForBaseVoxel * (BASE_VOXEL / VOXEL_SIZE);
         }
     }
 

@@ -43,6 +43,12 @@ namespace Voxels
             {
                 playerCamera.fieldOfView = 60f;
                 playerCamera.nearClipPlane = Mathf.Max(0.05f, VoxelMetrics.VOXEL_SIZE * 0.2f);
+                var world = FindFirstObjectByType<World>();
+                if (world != null)
+                {
+                    float chunkDiag = VoxelMetrics.ChunkWorldSize.magnitude;
+                    playerCamera.farClipPlane = Mathf.Max(1000f, world.ViewRadius * chunkDiag * 1.2f);
+                }
                 var localPos = playerCamera.transform.localPosition;
                 localPos.y = 0.14f;
                 playerCamera.transform.localPosition = localPos;
